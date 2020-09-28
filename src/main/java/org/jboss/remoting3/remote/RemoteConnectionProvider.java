@@ -30,6 +30,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.StringTokenizer;
 import java.util.concurrent.Executor;
 import java.util.function.UnaryOperator;
 
@@ -39,6 +40,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.security.sasl.SaslClientFactory;
 
+import org.jboss.remoting3.proxy.HttpConnect;
 import org.jboss.remoting3.spi.AbstractHandleableCloseable;
 import org.jboss.remoting3.spi.ConnectionHandlerFactory;
 import org.jboss.remoting3.spi.ConnectionProvider;
@@ -88,6 +90,8 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
     private final XnioWorker xnioWorker;
     private final ConnectionProviderContext connectionProviderContext;
     private final boolean sslRequired;
+    private final boolean sslEnabled;
+//    private final boolean sslStartTLS;
     private final Collection<Cancellable> pendingInboundConnections = Collections.synchronizedSet(new HashSet<Cancellable>());
     private final Set<RemoteConnectionHandler> handlers = Collections.synchronizedSet(new HashSet<RemoteConnectionHandler>());
     private final MBeanServer server;
@@ -96,6 +100,8 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
     RemoteConnectionProvider(final OptionMap optionMap, final ConnectionProviderContext connectionProviderContext, final String protocolName) throws IOException {
         super(connectionProviderContext.getExecutor());
         sslRequired = optionMap.get(Options.SECURE, false);
+        sslEnabled = optionMap.get(Options.SSL_ENABLED, true);
+//        sslStartTLS = optionMap.get(Options.SSL_STARTTLS, true);
         xnioWorker = connectionProviderContext.getXnioWorker();
         this.connectionProviderContext = connectionProviderContext;
         MBeanServer server = null;
@@ -173,7 +179,7 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
         });
         final IoFuture<ConnectionHandlerFactory> returnedFuture = cancellableResult.getIoFuture();
         returnedFuture.addNotifier(IoUtils.<ConnectionHandlerFactory>resultNotifier(), result);
-        final boolean useSsl = sslRequired || connectOptions.get(Options.SSL_ENABLED, true);
+        final boolean useSsl = sslRequired || sslEnabled;
         final ChannelListener<StreamConnection> openListener = new ChannelListener<StreamConnection>() {
             public void handleEvent(final StreamConnection connection) {
                 try {
@@ -235,16 +241,73 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
         return returnedFuture;
     }
 
+    private String filterNonProxyHosts(String host) {
+        // analogous to OpenJDK (sun.net.spi.DefaultProxySelector, sun.misc.RegexpPool):
+        //   - separate patterns with pipe (|)
+        //   - support glob (*) at start or end of host patterns
+        //   - match case-insensitive
+        final String nonProxyHosts = System.getProperty("http.nonProxyHosts", "");
+        if (!nonProxyHosts.isEmpty()) {
+            String lhost = host.toLowerCase();
+            StringTokenizer st = new StringTokenizer(nonProxyHosts, "|", false);
+            while (st.hasMoreTokens()) {
+                String pattern = st.nextToken().toLowerCase();
+                int n = pattern.length();
+                boolean match;
+                if (pattern.charAt(0) == '*') {
+                    match = lhost.endsWith(pattern.substring(1));
+                }
+                else if (pattern.charAt(n-1) == '*') {
+                    match = lhost.startsWith(pattern.substring(0, n-1));
+                }
+                else {
+                    match = lhost.equals(pattern);
+                }
+                if (match) {
+                    return "";
+                }
+            }
+        }
+        return host;
+    }
+
+    private InetSocketAddress getHttpEndpoint(final InetSocketAddress destination) {
+        String proxyHost = System.getProperty("http.proxyHost", "");
+        if (!proxyHost.isEmpty()) {
+            proxyHost = filterNonProxyHosts(proxyHost);
+        }
+        InetSocketAddress endpoint = destination;
+        if (!proxyHost.isEmpty()) {
+            endpoint = new InetSocketAddress(proxyHost, Integer.parseInt(System.getProperty("http.proxyPort", "8080")));
+        }
+        return endpoint;
+    }
+
     protected IoFuture<StreamConnection> createConnection(final URI uri, final InetSocketAddress bindAddress, final InetSocketAddress destination, final OptionMap connectOptions, final ChannelListener<StreamConnection> openListener) {
         return bindAddress == null ?
-               xnioWorker.openStreamConnection(destination, openListener, connectOptions) :
-               xnioWorker.openStreamConnection(bindAddress, destination, openListener, null, connectOptions);
+               xnioWorker.openStreamConnection(getHttpEndpoint(destination), openListener, connectOptions) :
+               xnioWorker.openStreamConnection(bindAddress, getHttpEndpoint(destination), openListener, null, connectOptions);
+    }
+
+    private InetSocketAddress getHttpsEndpoint(final InetSocketAddress destination) {
+        String proxyHost = System.getProperty("https.proxyHost", "");
+        if (!proxyHost.isEmpty()) {
+            proxyHost = filterNonProxyHosts(proxyHost);
+        }
+        InetSocketAddress endpoint = destination;
+        if (!proxyHost.isEmpty()) {
+            endpoint = new InetSocketAddress(proxyHost, Integer.parseInt(System.getProperty("https.proxyPort", "8443")));
+        }
+        return endpoint;
     }
 
     protected IoFuture<SslConnection> createSslConnection(final URI uri, final InetSocketAddress bindAddress, final InetSocketAddress destination, final OptionMap connectOptions, final AuthenticationConfiguration configuration, final SSLContext sslContext, final ChannelListener<StreamConnection> openListener) {
-        final IoFuture<StreamConnection> futureConnection = bindAddress == null ?
-                                                            xnioWorker.openStreamConnection(destination, null, connectOptions) :
-                                                            xnioWorker.openStreamConnection(bindAddress, destination, null, null, connectOptions);
+        InetSocketAddress endpoint = getHttpsEndpoint(destination);
+        final boolean hasProxy = endpoint != destination;
+        final IoFuture<StreamConnection> futureConnection =
+            bindAddress == null ?
+                xnioWorker.openStreamConnection(endpoint, null, connectOptions) :
+                xnioWorker.openStreamConnection(bindAddress, endpoint, null, null, connectOptions);
         final FutureResult<SslConnection> futureResult = new FutureResult<>(connectionProviderContext.getExecutor());
         futureResult.addCancelHandler(futureConnection);
         futureConnection.addNotifier(new IoFuture.HandlingNotifier<StreamConnection, FutureResult<SslConnection>>() {
@@ -257,6 +320,9 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
             }
 
             public void handleDone(final StreamConnection streamConnection, final FutureResult<SslConnection> result) {
+                if (hasProxy) {
+                    HttpConnect.performConnect(streamConnection, destination, connectOptions, futureResult);
+                }
                 final AuthenticationContextConfigurationClient configurationClient = ClientConnectionOpenListener.AUTH_CONFIGURATION_CLIENT;
                 final String realHost = configurationClient.getRealHost(uri, configuration);
                 final int realPort = configurationClient.getRealPort(uri, configuration);
@@ -329,7 +395,7 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
             // - SSL_ENABLED can be used to forbid SSL if SSL is not required, but not to require it if it is not present
             // - Both SSL_ENABLED and STARTTLS have to be enabled to provide SSL if SSL is not required
             // - If SSL is required then STARTTLS has no effect and is never enabled
-            if (sslContext != null && (sslRequired || optionMap.get(Options.SSL_ENABLED, true) && optionMap.get(Options.SSL_STARTTLS, true))) {
+            if (sslContext != null && (sslRequired || sslEnabled && optionMap.get(Options.SSL_STARTTLS, true))) {
                 result = xnioWorker.createStreamConnectionServer(bindAddress, channel -> {
                     final StreamConnection streamConnection = acceptAndConfigure(channel);
                     if (streamConnection == null) return;
