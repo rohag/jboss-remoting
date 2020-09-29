@@ -26,12 +26,14 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.Key;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
 import java.util.Base64;
 import java.util.Map;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 
-import sun.security.provider.MD4;
+import static org.jboss.remoting3._private.Messages.log;
 
 /**
  * Algorithm for computing proxy auth response of "NTLM" authorization scheme.
@@ -44,12 +46,21 @@ import sun.security.provider.MD4;
  */
 public class NtlmProxyAuthResponse implements ProxyAuthResponse {
 
-    private static final Base64.Encoder encoder = Base64.getEncoder();
+    private static final Base64.Encoder ENCODER;
+    private static final Provider MD4_PROVIDER;
 
     private final Charset charset;
 
     private final String domain;
     private final String workstation;
+
+    static {
+        ENCODER = Base64.getEncoder();
+        MD4_PROVIDER = new Provider("MD4", 1.0d/*"1.0"*/, "MD4 message digest") {
+            private static final long serialVersionUID = 1L;
+        };
+        MD4_PROVIDER.put("MessageDigest.MD4", "sun.security.provider.MD4");
+    }
 
     public NtlmProxyAuthResponse(String domain, String workstation) {
         this(StandardCharsets.UTF_8, domain, workstation);
@@ -159,8 +170,14 @@ public class NtlmProxyAuthResponse implements ProxyAuthResponse {
 
     private static byte[] ntlmHash(String password) throws GeneralSecurityException {
         byte[] unicodePassword = password.getBytes(StandardCharsets.UTF_16LE);
-        MessageDigest md4 = MD4.getInstance(); //MessageDigest.getInstance("MD4");
-        return md4.digest(unicodePassword);
+        try {
+            MessageDigest md4 = MessageDigest.getInstance("MD4", MD4_PROVIDER);
+            return md4.digest(unicodePassword);
+        }
+        catch (NoSuchAlgorithmException ex) {
+            log.error("Failed to instantiate MD4 digest algorithm", ex);
+            throw ex;
+        }
     }
 
     private static byte[] lmResponse(byte[] hash, byte[] challenge) throws GeneralSecurityException {
@@ -198,7 +215,7 @@ public class NtlmProxyAuthResponse implements ProxyAuthResponse {
 //    }
 
     private String encode(byte[] buffer) {
-        return new String(encoder.encode(buffer), this.charset);
+        return new String(ENCODER.encode(buffer), this.charset);
     }
 
     @Override
@@ -235,6 +252,9 @@ public class NtlmProxyAuthResponse implements ProxyAuthResponse {
                     writeString(buffer, this.workstation, StandardCharsets.US_ASCII);
                 }
             } catch (IOException ex) {
+                if (log.isDebugEnabled()) {
+                    log.debug(ex.getMessage(), ex);
+                }
                 return null;
             }
         }
@@ -299,7 +319,10 @@ public class NtlmProxyAuthResponse implements ProxyAuthResponse {
                 if (wlen > 0) {
                     writeString(buffer, this.workstation, charset);
                 }
-            } catch (IOException|GeneralSecurityException ex) {
+            } catch (IOException | GeneralSecurityException ex) {
+                if (log.isDebugEnabled()) {
+                    log.debug(ex.getMessage(), ex);
+                }
                 return null;
             }
 
