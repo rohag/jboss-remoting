@@ -241,7 +241,7 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
         return returnedFuture;
     }
 
-    private String filterNonProxyHosts(String host) {
+    private boolean needsProxyHosts(String host) {
         // analogous to OpenJDK (sun.net.spi.DefaultProxySelector, sun.misc.RegexpPool):
         //   - separate patterns with pipe (|)
         //   - support glob (*) at start or end of host patterns
@@ -264,23 +264,21 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
                     match = lhost.equals(pattern);
                 }
                 if (match) {
-                    return "";
+                    return false;
                 }
             }
         }
-        return host;
+        return true;
     }
 
     private InetSocketAddress getHttpEndpoint(final InetSocketAddress destination) {
         String proxyHost = System.getProperty("http.proxyHost", "");
-        if (!proxyHost.isEmpty()) {
-            proxyHost = filterNonProxyHosts(proxyHost);
+        if (!proxyHost.isEmpty() && needsProxyHosts(destination.getHostName().toLowerCase())) {
+            return new InetSocketAddress(proxyHost, Integer.parseInt(System.getProperty("http.proxyPort", "8080")));
         }
-        InetSocketAddress endpoint = destination;
-        if (!proxyHost.isEmpty()) {
-            endpoint = new InetSocketAddress(proxyHost, Integer.parseInt(System.getProperty("http.proxyPort", "8080")));
+        else {
+            return destination;
         }
-        return endpoint;
     }
 
     protected IoFuture<StreamConnection> createConnection(final URI uri, final InetSocketAddress bindAddress, final InetSocketAddress destination, final OptionMap connectOptions, final ChannelListener<StreamConnection> openListener) {
@@ -291,14 +289,12 @@ class RemoteConnectionProvider extends AbstractHandleableCloseable<ConnectionPro
 
     private InetSocketAddress getHttpsEndpoint(final InetSocketAddress destination) {
         String proxyHost = System.getProperty("https.proxyHost", "");
-        if (!proxyHost.isEmpty()) {
-            proxyHost = filterNonProxyHosts(proxyHost);
+        if (!proxyHost.isEmpty() && needsProxyHosts(destination.getHostName().toLowerCase())) {
+            return new InetSocketAddress(proxyHost, Integer.parseInt(System.getProperty("https.proxyPort", "8443")));
         }
-        InetSocketAddress endpoint = destination;
-        if (!proxyHost.isEmpty()) {
-            endpoint = new InetSocketAddress(proxyHost, Integer.parseInt(System.getProperty("https.proxyPort", "8443")));
+        else {
+            return destination;
         }
-        return endpoint;
     }
 
     protected IoFuture<SslConnection> createSslConnection(final URI uri, final InetSocketAddress bindAddress, final InetSocketAddress destination, final OptionMap connectOptions, final AuthenticationConfiguration configuration, final SSLContext sslContext, final ChannelListener<StreamConnection> openListener) {
